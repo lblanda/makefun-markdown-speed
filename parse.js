@@ -572,8 +572,9 @@ function scanClosers(src) {
 // --- lexer + parser (faithful reimplementation of marked 18.1.3, defaults:
 // gfm true, breaks false, pedantic false, async false) ---
 export function parse(src) {
-  src = src.replace(carriageReturnRe, '\n');
+  if (src.includes('\r')) src = src.replace(carriageReturnRe, '\n');
   const links = Object.create(null);
+  let hasLinkDefs = false;
   const inlineQueue = [];
   const state = { inLink: false, inRawBlock: false, linkEmitted: false, linkParenPossible: true, top: true };
 
@@ -935,15 +936,22 @@ export function parse(src) {
       const rem = len - pos;
       if (rem < srcLength) srcLength = rem;
       else infiniteLoop(src.charCodeAt(pos));
+      // First-char dispatch: each block tokenizer can only start at a few
+      // characters. A block starting with a letter (the common case) only
+      // ever tries table, lheading, paragraph and text. The order of tries
+      // follows marked exactly; a tokenizer is skipped only when its pattern
+      // cannot match at this first character.
+      const ch = src.charCodeAt(pos);
+      const indented = ch === 32 || ch === 9 || ch === 10;
       let token;
-      if ((token = tokSpace(src, pos))) {
+      if (indented && (token = tokSpace(src, pos))) {
         pos += token.raw.length;
         const lastToken = tokens.at(-1);
         if (token.raw.length === 1 && lastToken !== undefined) lastToken.raw += '\n';
         else tokens.push(token);
         continue;
       }
-      if ((token = tokCode(src, pos))) {
+      if (indented && (token = tokCode(src, pos))) {
         pos += token.raw.length;
         const lastToken = tokens.at(-1);
         if (lastToken?.type === 'paragraph' || lastToken?.type === 'text') {
@@ -953,13 +961,13 @@ export function parse(src) {
         } else tokens.push(token);
         continue;
       }
-      if ((token = tokFences(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokHeading(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokHr(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokBlockquote(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokList(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokHtml(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokDef(src, pos))) {
+      if ((indented || ch === 96 || ch === 126) && (token = tokFences(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      if ((indented || ch === 35) && (token = tokHeading(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      if ((indented || ch === 45 || ch === 95 || ch === 42) && (token = tokHr(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      if ((indented || ch === 62) && (token = tokBlockquote(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      if ((indented || ch === 42 || ch === 43 || ch === 45 || (ch >= 48 && ch <= 57)) && (token = tokList(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      if ((indented || ch === 60) && (token = tokHtml(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      if ((indented || ch === 91) && (token = tokDef(src, pos))) {
         pos += token.raw.length;
         const lastToken = tokens.at(-1);
         if (lastToken?.type === 'paragraph' || lastToken?.type === 'text') {
@@ -967,7 +975,7 @@ export function parse(src) {
           lastToken.text += '\n' + token.raw;
           inlineQueue.at(-1).src = lastToken.text;
         } else {
-          if (!links[token.tag]) links[token.tag] = { href: token.href, title: token.title };
+          if (!links[token.tag]) { links[token.tag] = { href: token.href, title: token.title }; hasLinkDefs = true; }
           tokens.push(token);
         }
         continue;
@@ -1002,7 +1010,6 @@ export function parse(src) {
     state.top = true;
     return tokens;
   }
-
   // ----- inline helpers -----
   function isLabelEndInsideToken(src, pos, label, labelStart) {
     if (!label.includes('<')) return false;
@@ -1063,7 +1070,8 @@ export function parse(src) {
     const hasEscape = src.includes('\\');
     const hasCode = src.includes('`');
     const hasTag = src.includes('<');
-    if (hasBracket) {
+    // A reflink mask can only change a run when some label is defined.
+    if (hasBracket && hasLinkDefs) {
       const maskReflink = (match0) => {
         const refStart = match0.lastIndexOf('[');
         if (!Object.hasOwn(links, normalizeLabel(match0.slice(refStart + 1, -1)))) return match0;
@@ -1330,9 +1338,7 @@ export function parse(src) {
         if ((token = tokLink(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
         if ((token = tokReflink(src, pos))) {
           pos += token.raw.length;
-          const lastToken = tokens.at(-1);
-          if (token.type === 'text' && lastToken?.type === 'text') { lastToken.raw += token.raw; lastToken.text += token.text; }
-          else tokens.push(token);
+          tokens.push(token);
           continue;
         }
       } else if (ch === 42) { // *: em/strong
@@ -1354,9 +1360,9 @@ export function parse(src) {
         pos += token.raw.length;
         if (token.raw.slice(-1) !== '_') prevChar = token.raw.slice(-1);
         keepPrevChar = true;
-        const lastToken = tokens.at(-1);
-        if (lastToken?.type === 'text') { lastToken.raw += token.raw; lastToken.text += token.text; }
-        else tokens.push(token);
+        // Consecutive text tokens are left unmerged: the renderer only
+        // concatenates them, so merging (string copies per chunk) buys nothing.
+        tokens.push(token);
         continue;
       }
       infiniteLoop(src.charCodeAt(pos));
