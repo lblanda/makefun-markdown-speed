@@ -702,9 +702,13 @@ export function parse(src) {
   function tokList(src, pos) {
     const cap0 = ex(S.list, src, pos);
     if (cap0) {
+      // Cursor-based: the original walks the list with repeated
+      // src.substring() per line, which copies the whole remainder each time
+      // (quadratic in list length). Here p is an index into listSrc and lines
+      // are sliced only as far as the next newline.
       const listSrc = src.slice(pos);
-      const taken = () => listSrc.length - rest.length;
-      let rest = listSrc;
+      const len = listSrc.length;
+      let p = 0;
       let bull = cap0[1].trim();
       const isordered = bull.length > 1;
       const list = {
@@ -712,20 +716,21 @@ export function parse(src) {
         start: isordered ? +bull.slice(0, -1) : '', loose: false, items: [],
       };
       bull = isordered ? `\\d{1,9}\\${bull.slice(-1)}` : `\\${bull}`;
-      const itemRegex = new RegExp(`^( {0,3}${bull})((?:[\\t ][^\\n]*)?(?:\\n|$))`);
+      const itemRegex = sticky(new RegExp(`^( {0,3}${bull})((?:[\\t ][^\\n]*)?(?:\\n|$))`));
       let endsWithBlankLine = false;
-      while (rest) {
+      while (p < len) {
         let endEarly = false;
         let itemContents = '';
         let cap;
-        if (!(cap = itemRegex.exec(rest))) break;
-        if (ex(S.hr, rest, 0)) break;
-        const itemStart = taken();
-        rest = rest.substring(cap[0].length);
+        if (!(cap = ex(itemRegex, listSrc, p))) break;
+        if (ex(S.hr, listSrc, p)) break;
+        const itemStart = p;
+        p += cap[0].length;
         const firstLine = cap[2].split('\n', 1)[0];
         const bulletIndent = cap[1].length;
         let line = firstLine.replace(leadingSpaceTabRe, (whitespace) => expandTabs(whitespace, bulletIndent));
-        let nextLine = rest.split('\n', 1)[0];
+        let nl = listSrc.indexOf('\n', p);
+        let nextLine = nl === -1 ? listSrc.slice(p) : listSrc.slice(p, nl);
         let blankLine = !line.trim();
         let indent = 0;
         if (blankLine) {
@@ -737,7 +742,7 @@ export function parse(src) {
           indent += bulletIndent;
         }
         if (blankLine && blankLineRe.test(nextLine)) {
-          rest = rest.substring(nextLine.length + 1);
+          p = nl === -1 ? len : nl + 1;
           endEarly = true;
         }
         if (!endEarly) {
@@ -747,8 +752,9 @@ export function parse(src) {
           const headingBeginRe = headingBeginRegex(indent);
           const htmlBeginRe = htmlBeginRegex(indent);
           const blockquoteBeginRe = blockquoteBeginRegex(indent);
-          while (rest) {
-            const rawLine = rest.split('\n', 1)[0];
+          while (p < len) {
+            nl = listSrc.indexOf('\n', p);
+            const rawLine = nl === -1 ? listSrc.slice(p) : listSrc.slice(p, nl);
             let nextLineWithoutTabs;
             nextLine = rawLine;
             nextLineWithoutTabs = nextLine.replace(leadingSpaceTabRe, (whitespace) => expandTabs(whitespace));
@@ -775,11 +781,11 @@ export function parse(src) {
               itemContents += '\n' + continuation;
             }
             blankLine = !nextLine.trim();
-            rest = rest.substring(rawLine.length + 1);
+            p = nl === -1 ? len : nl + 1;
             line = nextLineWithoutTabs.slice(indent);
           }
         }
-        const raw = listSrc.slice(itemStart, taken());
+        const raw = listSrc.slice(itemStart, p);
         if (!list.loose) {
           if (endsWithBlankLine) list.loose = true;
           else if (doubleBlankLineRe.test(raw)) endsWithBlankLine = true;
@@ -797,7 +803,7 @@ export function parse(src) {
       } else {
         return undefined;
       }
-      list.raw = listSrc.slice(0, taken()).trimEnd();
+      list.raw = listSrc.slice(0, p).trimEnd();
       for (const item of list.items) {
         state.top = false;
         item.tokens = blockTokens(item.text, []);
@@ -1050,8 +1056,14 @@ export function parse(src) {
     return false;
   }
   function maskSrc(src) {
+    // Each mask only fires on characters it can match; plain emphasis-heavy
+    // text (no [, \, ` or <) skips all three regex passes entirely.
     let maskedSrc = src;
-    if (src.includes('[')) {
+    const hasBracket = src.includes('[');
+    const hasEscape = src.includes('\\');
+    const hasCode = src.includes('`');
+    const hasTag = src.includes('<');
+    if (hasBracket) {
       const maskReflink = (match0) => {
         const refStart = match0.lastIndexOf('[');
         if (!Object.hasOwn(links, normalizeLabel(match0.slice(refStart + 1, -1)))) return match0;
@@ -1065,15 +1077,19 @@ export function parse(src) {
       };
       maskedSrc = maskedSrc.replace(reflinkSearchRe, maskReflink);
     }
-    maskedSrc = maskedSrc.replace(anyPunctuationOutsideCodeRe, (match0, code, punct) => {
-      if (punct) return '+'.repeat(match0.length);
-      if (code) return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-      return match0;
-    });
-    maskedSrc = maskedSrc.replace(blockSkipRe, (match0, _link, context) => {
-      const offset = context ? context.length : 0;
-      return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
-    });
+    if (hasEscape || hasCode) {
+      maskedSrc = maskedSrc.replace(anyPunctuationOutsideCodeRe, (match0, code, punct) => {
+        if (punct) return '+'.repeat(match0.length);
+        if (code) return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+        return match0;
+      });
+    }
+    if (hasBracket || hasCode || hasTag) {
+      maskedSrc = maskedSrc.replace(blockSkipRe, (match0, _link, context) => {
+        const offset = context ? context.length : 0;
+        return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
+      });
+    }
     return maskedSrc;
   }
 
@@ -1298,23 +1314,42 @@ export function parse(src) {
       else infiniteLoop(src.charCodeAt(pos));
       if (!keepPrevChar) prevChar = '';
       keepPrevChar = false;
+      // First-char dispatch: each inline tokenizer can only match at a few
+      // starting characters, and marked tries them in a fixed order. Trying
+      // only the ones that can match preserves the order exactly while
+      // skipping up to nine failed regex matches per text chunk.
+      const ch = src.charCodeAt(pos);
       let token;
-      if ((token = tokEscape(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokTag(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokLink(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokReflink(src, pos))) {
-        pos += token.raw.length;
-        const lastToken = tokens.at(-1);
-        if (token.type === 'text' && lastToken?.type === 'text') { lastToken.raw += token.raw; lastToken.text += token.text; }
-        else tokens.push(token);
-        continue;
+      if (ch === 92) { // backslash: escape, then br
+        if ((token = tokEscape(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+        if ((token = tokBr(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      } else if (ch === 60) { // <: tag, then autolink
+        if ((token = tokTag(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+        if ((token = tokAutolink(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      } else if (ch === 91 || ch === 33) { // [ or !: link, then reflink/nolink
+        if ((token = tokLink(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+        if ((token = tokReflink(src, pos))) {
+          pos += token.raw.length;
+          const lastToken = tokens.at(-1);
+          if (token.type === 'text' && lastToken?.type === 'text') { lastToken.raw += token.raw; lastToken.text += token.text; }
+          else tokens.push(token);
+          continue;
+        }
+      } else if (ch === 42) { // *: em/strong
+        if ((token = tokEmStrong(src, pos, maskedSrc, hints, prevChar))) { pos += token.raw.length; tokens.push(token); continue; }
+      } else if (ch === 95) { // _: em/strong, then url (an email may start with _)
+        if ((token = tokEmStrong(src, pos, maskedSrc, hints, prevChar))) { pos += token.raw.length; tokens.push(token); continue; }
+        if (!state.inLink && (token = tokUrl(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      } else if (ch === 96) { // `: code span
+        if ((token = tokCodespan(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      } else if (ch === 32) { // space: br (two spaces + newline)
+        if ((token = tokBr(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
+      } else if (ch === 126) { // ~: strikethrough
+        if ((token = tokDel(src, pos, maskedSrc, hints, prevChar))) { pos += token.raw.length; tokens.push(token); continue; }
+      } else if (!state.inLink && (ch === 46 || ch === 43 || ch === 45 || (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122))) {
+        // letter, digit, '.', '+' or '-': a url may start here
+        if ((token = tokUrl(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
       }
-      if ((token = tokEmStrong(src, pos, maskedSrc, hints, prevChar))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokCodespan(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokBr(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokDel(src, pos, maskedSrc, hints, prevChar))) { pos += token.raw.length; tokens.push(token); continue; }
-      if ((token = tokAutolink(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
-      if (!state.inLink && (token = tokUrl(src, pos))) { pos += token.raw.length; tokens.push(token); continue; }
       if ((token = tokInlineText(src, pos))) {
         pos += token.raw.length;
         if (token.raw.slice(-1) !== '_') prevChar = token.raw.slice(-1);
